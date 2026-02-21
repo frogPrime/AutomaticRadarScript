@@ -42,6 +42,9 @@ local CFG = {
   spamEvery = 1.0,
 
   stopOnNewCommand = true,
+
+  -- ✅ 单机模式：按 / 切换
+  singleMode = false,
 }
 
 for _,n in ipairs(peripheral.getNames()) do
@@ -93,6 +96,7 @@ print("Listening:", PROTO_CMD, PROTO_NAV, "and", PROTO_SHIP)
 print("move inputs: x=turn, y=up/down, z=throttle")
 print("MODE:", CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)")
 print("Hotkey: press B to toggle BOAT/AIRSHIP mode")
+print("Hotkey: press / to toggle SINGLE mode (toggle will STOP immediately)")
 
 local ship=nil
 local lastShipAt=0
@@ -129,6 +133,13 @@ local function onNewTarget(t)
   ))
 end
 
+local function stopNow(reason)
+  target=nil
+  mode="DONE"
+  safeMove(0,0,0)
+  if reason then print(reason) end
+end
+
 local function helloThread()
   while true do
     rednet.broadcast({
@@ -156,10 +167,83 @@ local function setModeAfterToggle()
   end
 end
 
--- ✅ Key listener (press B)
+-- ✅ 解析坐标输入：支持 "x y z" 或 "x, y, z"
+local function parseCoords(line)
+  if type(line) ~= "string" then return nil end
+  local s = line:gsub(",", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then return nil end
+  local a,b,c = s:match("^(-?%d+%.?%d*)%s+(-?%d+%.?%d*)%s+(-?%d+%.?%d*)$")
+  if not a then return nil end
+  return tonumber(a), tonumber(b), tonumber(c)
+end
+
+-- ✅ 事件式输入：按 / 可立即切换(并停船)；支持退格/回车
+local function readLineInterruptible(prompt)
+  if prompt then io.write(prompt) end
+  local buf = ""
+
+  while true do
+    local ev, a1 = os.pullEvent()
+
+    if ev == "char" then
+      buf = buf .. a1
+      io.write(a1)
+
+    elseif ev == "key" then
+      if a1 == keys.enter then
+        print()
+        return buf
+
+      elseif a1 == keys.backspace then
+        if #buf > 0 then
+          buf = buf:sub(1, -2)
+          io.write("\b \b")
+        end
+
+      elseif a1 == keys.slash then
+        -- ✅ 直接按 / 切换单机模式，并立刻停船
+        CFG.singleMode = not CFG.singleMode
+        stopNow("SINGLE TOGGLED -> " .. (CFG.singleMode and "ON" or "OFF") .. " (STOPPED)")
+        os.queueEvent("single_toggle")
+        print() -- 换行，避免光标残留
+        return nil
+      end
+    end
+  end
+end
+
+-- ✅ 单机输入线程：单机 ON 时输入坐标，新坐标覆盖旧目标
+local function singleInputThread()
+  while true do
+    os.pullEvent("single_toggle")
+    if CFG.singleMode then
+      print("[SINGLE] ON  输入坐标: x y z 或 x,y,z （按 / 退出，切换会立刻停船）")
+      while CFG.singleMode do
+        local line = readLineInterruptible("[SINGLE] > ")
+        if not CFG.singleMode then break end
+        if not line then
+          -- 被 / 打断切换了
+          break
+        end
+
+        local x,y,z = parseCoords(line)
+        if x and y and z then
+          onNewTarget({x=x, y=y, z=z, name="single"})
+        else
+          print("[SINGLE] 输入无效。例子: 123 64 -80   或   123,64,-80")
+        end
+      end
+    else
+      print("[SINGLE] OFF")
+    end
+  end
+end
+
+-- ✅ Key listener (press B or /)
 local function inputThread()
   while true do
     local ev, key = os.pullEvent("key")
+
     if key == keys.b then
       CFG.isBoat = not CFG.isBoat
 
@@ -169,6 +253,12 @@ local function inputThread()
       setModeAfterToggle()
 
       print("MODE TOGGLED -> " .. (CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)"))
+
+    elseif key == keys.slash then
+      -- ✅ / 切换单机模式：切换就停船（清目标 + 刹车）
+      CFG.singleMode = not CFG.singleMode
+      stopNow("SINGLE TOGGLED -> " .. (CFG.singleMode and "ON" or "OFF") .. " (STOPPED)")
+      os.queueEvent("single_toggle")
     end
   end
 end
@@ -192,6 +282,10 @@ local function controlThread()
           ship = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z)}
           lastShipAt=os.clock()
         end
+
+      elseif CFG.singleMode and (proto==PROTO_CMD or proto==PROTO_NAV) then
+        -- ✅ 单机模式：忽略网络导航/停船指令（只听本地输入）
+        -- do nothing
 
       elseif proto==PROTO_CMD and type(msg)=="table" and msg.kind=="ship_cmd" then
         if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
@@ -331,5 +425,5 @@ local function controlThread()
   end
 end
 
--- ✅ add inputThread here
-parallel.waitForAny(controlThread, helloThread, inputThread)
+-- ✅ add inputThread + singleInputThread here
+parallel.waitForAny(controlThread, helloThread, inputThread, singleInputThread)
