@@ -29,7 +29,7 @@ local CFG = {
 }
 
 -- ✅ 只连接指定 hostname 的 radar server（改成你的服务端打印出来的 hostname）
-local WANT_HOSTNAME = "radar_server_4"
+local WANT_HOSTNAME = "radar_server_"
 
 -------------------------
 -- rednet init (OPEN ALL MODEMS + HANDSHAKE)
