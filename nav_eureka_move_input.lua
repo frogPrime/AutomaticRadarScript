@@ -21,25 +21,25 @@ local CFG = {
   arriveDist = 3.5,
 
   -- MODE
-  isBoat = true,            -- ✅ 船模式：只用 x(turn) 和 z(throttle)，永远不动 y（按 B 切换）
+  isBoat = true,            -- 船模式：只用 x(turn) 和 z(throttle)，永远不动 y（按 B 切换）
   useCruiseAltitude = true, -- 飞艇才用；船模式会强制忽略
   cruiseY = nil,
   cruiseAboveTarget = 12.0,
   climbArriveDy = 1.5,
   descendDist = 22.0,
 
-  -- ✅ NET MODE
+  -- NET MODE
   netOnline = true,         -- ONLINE=接收 SHIP_CMD；OFFLINE=手动输入坐标（仍接收 SHIP_POS）
 
   -- input tuning
-  turnGain = 1.2, -- 船更稳一点（可按需调回 2.0）
-  turnMax  = 0.7, -- 船更稳一点（可按需调回 1.0）
+  turnGain = 1.2,
+  turnMax  = 0.7,
   upGain   = 0.2,
   upMax    = 1.0,
 
   throttleFar = 1.0,
-  throttleNear = 0.12, -- 船靠近更慢（可按需调回 0.20）
-  slowDist = 60.0,     -- 船减速圈更小（可按需调回 90.0）
+  throttleNear = 0.12,
+  slowDist = 60.0,
   minThrottleDist = 3.5,
 
   spamEvery = 1.0,
@@ -111,10 +111,10 @@ local mode="DONE"
 local cmdSeq = 0
 local brakeThisTick = false
 
--- ✅ 防止按键切换把字符残留到 read()（比如 'm'）
+-- 防止按键切换把字符残留到输入里（m/b）
 local consoleJustToggled = false
 
--- ✅ STOP + CLEAR helper
+-- STOP + CLEAR helper
 local function stopAndClear(reason)
   target=nil
   mode="DONE"
@@ -161,7 +161,7 @@ local function helloThread()
   end
 end
 
--- ✅ Toggle helper
+-- Toggle helper
 local function setModeAfterToggle()
   if not target then
     mode = "DONE"
@@ -175,32 +175,66 @@ local function setModeAfterToggle()
   end
 end
 
--- ✅ Key listener (press B/M)
+-- ✅ 安全读取一行：不吞 rednet_message（会把非输入事件放回队列）
+local function readLineSafe(prompt)
+  if prompt then write(prompt) end
+  local buf = ""
+
+  while true do
+    local ev = {os.pullEventRaw()} -- 不会被 terminate 直接打断（可选）
+
+    local name = ev[1]
+    if name == "char" then
+      local ch = ev[2]
+      buf = buf .. ch
+      write(ch)
+
+    elseif name == "paste" then
+      local txt = ev[2] or ""
+      buf = buf .. txt
+      write(txt)
+
+    elseif name == "key" then
+      local k = ev[2]
+      if k == keys.enter then
+        print()
+        return buf
+      elseif k == keys.backspace then
+        if #buf > 0 then
+          buf = buf:sub(1, -2)
+          -- 光标回退擦除
+          local x, y = term.getCursorPos()
+          if x > 1 then
+            term.setCursorPos(x - 1, y)
+            write(" ")
+            term.setCursorPos(x - 1, y)
+          end
+        end
+      end
+
+    else
+      -- ✅ 关键：把非输入事件（比如 rednet_message）放回队列，别吃掉
+      os.queueEvent(table.unpack(ev))
+      sleep(0)
+    end
+  end
+end
+
+-- Key listener (press B/M)
 local function inputThread()
   while true do
     local ev, key = os.pullEvent("key")
     if key == keys.b then
       CFG.isBoat = not CFG.isBoat
-
-      -- brake on toggle to avoid sudden output jumps
       safeMove(0,0,0)
-
       setModeAfterToggle()
-
-      -- ✅ 也吞掉可能残留的 'b'
       consoleJustToggled = true
-
       print("MODE TOGGLED -> " .. (CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)"))
 
     elseif key == keys.m then
       CFG.netOnline = not CFG.netOnline
-
-      -- ✅ 你要求：切换模式时立刻清空所有目标并且停止
       stopAndClear("[NET] TOGGLED -> " .. (CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)") .. " | STOPPED+CLEARED")
-
-      -- ✅ 吞掉残留字符（比如 'm'）
       consoleJustToggled = true
-
       if not CFG.netOnline then
         print("OFFLINE commands: goto x y z  |  stop")
       end
@@ -208,25 +242,30 @@ local function inputThread()
   end
 end
 
--- ✅ OFFLINE console: manual goto/stop (new command overrides old)
+-- OFFLINE console: manual goto/stop (new command overrides old)
 local function offlineConsoleThread()
   while true do
     if CFG.netOnline then
       sleep(0.2)
     else
-      -- ✅ 吞掉刚切换产生的 char（比如 m/b），避免 read() 里出现残留字母
+      -- 吞掉刚切换带来的残留 m/b，但不吞其它事件
       if consoleJustToggled then
         consoleJustToggled = false
-        local tid = os.startTimer(0)
         while true do
-          local ev, a = os.pullEvent()
-          if ev == "timer" and a == tid then break end
-          -- discard everything until timer fires (only this thread's queue)
+          local ev = {os.pullEvent()}
+          if ev[1] == "char" or ev[1] == "key" then
+            -- 丢弃一次输入残留即可（m/b 的 char，或者 key 释放等）
+            -- 如果你想更严格只丢 char，可改成只丢 char
+          else
+            os.queueEvent(table.unpack(ev))
+            break
+          end
+          -- 再丢一次就够了，避免无限循环
+          break
         end
       end
 
-      write("[OFFLINE] > ")
-      local line = read()
+      local line = readLineSafe("[OFFLINE] > ")
       if line then
         local parts = {}
         for w in string.gmatch(tostring(line), "%S+") do
@@ -261,7 +300,7 @@ local function controlThread()
   while true do
     brakeThisTick = false
 
-    -- Step 1: drain messages within tick (non-blocking)
+    -- drain messages within tick (non-blocking)
     local t0=os.clock()
     local newestNav = nil
 
@@ -278,7 +317,7 @@ local function controlThread()
         end
 
       elseif proto==PROTO_CMD and type(msg)=="table" and msg.kind=="ship_cmd" then
-        -- ✅ ONLINE 才接收来自客户端/服务器的指令；OFFLINE 忽略
+        -- ONLINE 才接收来自客户端/服务器的指令；OFFLINE 忽略
         if CFG.netOnline then
           if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
             newestNav = {
@@ -293,7 +332,6 @@ local function controlThread()
         end
 
       elseif proto==PROTO_NAV and type(msg)=="table" and msg.kind=="nav_goto" then
-        -- legacy: broadcast nav (no ship select)
         newestNav = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z), name=msg.name}
       end
     end
@@ -326,7 +364,7 @@ local function controlThread()
         else
           -- MODE SWITCHING
           if CFG.isBoat then
-            mode = "CRUISE" -- 船永远平面跑
+            mode = "CRUISE"
           else
             if CFG.useCruiseAltitude then
               if mode=="CLIMB" and math.abs(ship.y - cruiseY) <= CFG.climbArriveDy then
@@ -342,7 +380,6 @@ local function controlThread()
           -- Desired point
           local desired
           if CFG.isBoat then
-            -- 船：只追 x/z，y 保持当前高度（不做升降控制）
             desired = {x=target.x, y=ship.y, z=target.z}
           else
             if not CFG.useCruiseAltitude then
