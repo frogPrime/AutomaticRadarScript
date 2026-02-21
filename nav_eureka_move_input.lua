@@ -28,6 +28,9 @@ local CFG = {
   climbArriveDy = 1.5,
   descendDist = 22.0,
 
+  -- ✅ NET MODE
+  netOnline = true,         -- ONLINE=接收 SHIP_CMD；OFFLINE=手动输入坐标（仍接收 SHIP_POS）
+
   -- input tuning
   turnGain = 1.2, -- 船更稳一点（可按需调回 2.0）
   turnMax  = 0.7, -- 船更稳一点（可按需调回 1.0）
@@ -42,9 +45,6 @@ local CFG = {
   spamEvery = 1.0,
 
   stopOnNewCommand = true,
-
-  -- ✅ 单机模式：按 / 切换
-  singleMode = false,
 }
 
 for _,n in ipairs(peripheral.getNames()) do
@@ -95,8 +95,10 @@ print("SHIP_ID:", SHIP_ID, " NAME:", SHIP_NAME)
 print("Listening:", PROTO_CMD, PROTO_NAV, "and", PROTO_SHIP)
 print("move inputs: x=turn, y=up/down, z=throttle")
 print("MODE:", CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)")
+print("NET:", CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)")
 print("Hotkey: press B to toggle BOAT/AIRSHIP mode")
-print("Hotkey: press / to toggle SINGLE mode (toggle will STOP immediately)")
+print("Hotkey: press M to toggle OFFLINE/ONLINE (STOP+CLEAR)")
+print("OFFLINE commands: goto x y z  |  stop")
 
 local ship=nil
 local lastShipAt=0
@@ -108,6 +110,16 @@ local mode="DONE"
 
 local cmdSeq = 0
 local brakeThisTick = false
+
+-- ✅ STOP + CLEAR helper (mode toggle / stop commands use it)
+local function stopAndClear(reason)
+  target=nil
+  mode="DONE"
+  prevShip=nil
+  brakeThisTick=false
+  safeMove(0,0,0)
+  if reason then print(reason) end
+end
 
 local function onNewTarget(t)
   cmdSeq = cmdSeq + 1
@@ -131,13 +143,6 @@ local function onNewTarget(t)
     tostring(target.name),
     fmt1(target.x), fmt1(target.y), fmt1(target.z)
   ))
-end
-
-local function stopNow(reason)
-  target=nil
-  mode="DONE"
-  safeMove(0,0,0)
-  if reason then print(reason) end
 end
 
 local function helloThread()
@@ -167,83 +172,10 @@ local function setModeAfterToggle()
   end
 end
 
--- ✅ 解析坐标输入：支持 "x y z" 或 "x, y, z"
-local function parseCoords(line)
-  if type(line) ~= "string" then return nil end
-  local s = line:gsub(",", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  if s == "" then return nil end
-  local a,b,c = s:match("^(-?%d+%.?%d*)%s+(-?%d+%.?%d*)%s+(-?%d+%.?%d*)$")
-  if not a then return nil end
-  return tonumber(a), tonumber(b), tonumber(c)
-end
-
--- ✅ 事件式输入：按 / 可立即切换(并停船)；支持退格/回车
-local function readLineInterruptible(prompt)
-  if prompt then io.write(prompt) end
-  local buf = ""
-
-  while true do
-    local ev, a1 = os.pullEvent()
-
-    if ev == "char" then
-      buf = buf .. a1
-      io.write(a1)
-
-    elseif ev == "key" then
-      if a1 == keys.enter then
-        print()
-        return buf
-
-      elseif a1 == keys.backspace then
-        if #buf > 0 then
-          buf = buf:sub(1, -2)
-          io.write("\b \b")
-        end
-
-      elseif a1 == keys.slash then
-        -- ✅ 直接按 / 切换单机模式，并立刻停船
-        CFG.singleMode = not CFG.singleMode
-        stopNow("SINGLE TOGGLED -> " .. (CFG.singleMode and "ON" or "OFF") .. " (STOPPED)")
-        os.queueEvent("single_toggle")
-        print() -- 换行，避免光标残留
-        return nil
-      end
-    end
-  end
-end
-
--- ✅ 单机输入线程：单机 ON 时输入坐标，新坐标覆盖旧目标
-local function singleInputThread()
-  while true do
-    os.pullEvent("single_toggle")
-    if CFG.singleMode then
-      print("[SINGLE] ON  输入坐标: x y z 或 x,y,z （按 / 退出，切换会立刻停船）")
-      while CFG.singleMode do
-        local line = readLineInterruptible("[SINGLE] > ")
-        if not CFG.singleMode then break end
-        if not line then
-          -- 被 / 打断切换了
-          break
-        end
-
-        local x,y,z = parseCoords(line)
-        if x and y and z then
-          onNewTarget({x=x, y=y, z=z, name="single"})
-        else
-          print("[SINGLE] 输入无效。例子: 123 64 -80   或   123,64,-80")
-        end
-      end
-    else
-      print("[SINGLE] OFF")
-    end
-  end
-end
-
--- ✅ Key listener (press B or /)
+-- ✅ Key listener (press B/M)
 local function inputThread()
   while true do
     local ev, key = os.pullEvent("key")
-
     if key == keys.b then
       CFG.isBoat = not CFG.isBoat
 
@@ -254,11 +186,53 @@ local function inputThread()
 
       print("MODE TOGGLED -> " .. (CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)"))
 
-    elseif key == keys.slash then
-      -- ✅ / 切换单机模式：切换就停船（清目标 + 刹车）
-      CFG.singleMode = not CFG.singleMode
-      stopNow("SINGLE TOGGLED -> " .. (CFG.singleMode and "ON" or "OFF") .. " (STOPPED)")
-      os.queueEvent("single_toggle")
+    elseif key == keys.m then
+      CFG.netOnline = not CFG.netOnline
+
+      -- ✅ 你要求：切换模式时立刻清空所有目标并且停止
+      stopAndClear("[NET] TOGGLED -> " .. (CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)") .. " | STOPPED+CLEARED")
+
+      if not CFG.netOnline then
+        print("OFFLINE commands: goto x y z  |  stop")
+      end
+    end
+  end
+end
+
+-- ✅ OFFLINE console: manual goto/stop (new command overrides old)
+local function offlineConsoleThread()
+  while true do
+    if CFG.netOnline then
+      sleep(0.2)
+    else
+      write("[OFFLINE] > ")
+      local line = read()
+      if line then
+        local parts = {}
+        for w in string.gmatch(tostring(line), "%S+") do
+          table.insert(parts, w)
+        end
+
+        local cmd = (parts[1] or ""):lower()
+        if cmd == "goto" then
+          local x = tonumber(parts[2])
+          local y = tonumber(parts[3])
+          local z = tonumber(parts[4])
+          if x and y and z then
+            onNewTarget({x=x, y=y, z=z, name="manual"})
+          else
+            print("Usage: goto x y z")
+          end
+
+        elseif cmd == "stop" then
+          stopAndClear("[OFFLINE] STOP")
+
+        elseif cmd == "" then
+          -- ignore
+        else
+          print("Commands: goto x y z | stop")
+        end
+      end
     end
   end
 end
@@ -276,30 +250,26 @@ local function controlThread()
       if not sid then break end
 
       if proto==PROTO_SHIP and type(msg)=="table" and msg.kind=="ship_pos" then
-        -- IMPORTANT: only accept my ship_id
+        -- IMPORTANT: only accept my ship_id (始终接收)
         if msg.ship_id == SHIP_ID then
           prevShip = ship
           ship = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z)}
           lastShipAt=os.clock()
         end
 
-      elseif CFG.singleMode and (proto==PROTO_CMD or proto==PROTO_NAV) then
-        -- ✅ 单机模式：忽略网络导航/停船指令（只听本地输入）
-        -- do nothing
-
       elseif proto==PROTO_CMD and type(msg)=="table" and msg.kind=="ship_cmd" then
-        if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
-          newestNav = {
-            x=tonumber(msg.target.x),
-            y=tonumber(msg.target.y),
-            z=tonumber(msg.target.z),
-            name = msg.target_name or msg.name or "target"
-          }
-        elseif msg.ship_id == SHIP_ID and msg.type == "STOP" then
-          target=nil
-          mode="DONE"
-          safeMove(0,0,0)
-          print("[CMD] STOP")
+        -- ✅ ONLINE 才接收来自客户端/服务器的指令；OFFLINE 忽略
+        if CFG.netOnline then
+          if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
+            newestNav = {
+              x=tonumber(msg.target.x),
+              y=tonumber(msg.target.y),
+              z=tonumber(msg.target.z),
+              name = msg.target_name or msg.name or "target"
+            }
+          elseif msg.ship_id == SHIP_ID and msg.type == "STOP" then
+            stopAndClear("[CMD] STOP")
+          end
         end
 
       elseif proto==PROTO_NAV and type(msg)=="table" and msg.kind=="nav_goto" then
@@ -425,5 +395,5 @@ local function controlThread()
   end
 end
 
--- ✅ add inputThread + singleInputThread here
-parallel.waitForAny(controlThread, helloThread, inputThread, singleInputThread)
+-- ✅ add offlineConsoleThread here too
+parallel.waitForAny(controlThread, helloThread, inputThread, offlineConsoleThread)
