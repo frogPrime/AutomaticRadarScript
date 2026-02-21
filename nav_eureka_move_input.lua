@@ -111,7 +111,10 @@ local mode="DONE"
 local cmdSeq = 0
 local brakeThisTick = false
 
--- ✅ STOP + CLEAR helper (mode toggle / stop commands use it)
+-- ✅ 防止按键切换把字符残留到 read()（比如 'm'）
+local consoleJustToggled = false
+
+-- ✅ STOP + CLEAR helper
 local function stopAndClear(reason)
   target=nil
   mode="DONE"
@@ -184,6 +187,9 @@ local function inputThread()
 
       setModeAfterToggle()
 
+      -- ✅ 也吞掉可能残留的 'b'
+      consoleJustToggled = true
+
       print("MODE TOGGLED -> " .. (CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)"))
 
     elseif key == keys.m then
@@ -191,6 +197,9 @@ local function inputThread()
 
       -- ✅ 你要求：切换模式时立刻清空所有目标并且停止
       stopAndClear("[NET] TOGGLED -> " .. (CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)") .. " | STOPPED+CLEARED")
+
+      -- ✅ 吞掉残留字符（比如 'm'）
+      consoleJustToggled = true
 
       if not CFG.netOnline then
         print("OFFLINE commands: goto x y z  |  stop")
@@ -205,6 +214,17 @@ local function offlineConsoleThread()
     if CFG.netOnline then
       sleep(0.2)
     else
+      -- ✅ 吞掉刚切换产生的 char（比如 m/b），避免 read() 里出现残留字母
+      if consoleJustToggled then
+        consoleJustToggled = false
+        local tid = os.startTimer(0)
+        while true do
+          local ev, a = os.pullEvent()
+          if ev == "timer" and a == tid then break end
+          -- discard everything until timer fires (only this thread's queue)
+        end
+      end
+
       write("[OFFLINE] > ")
       local line = read()
       if line then
@@ -395,5 +415,4 @@ local function controlThread()
   end
 end
 
--- ✅ add offlineConsoleThread here too
 parallel.waitForAny(controlThread, helloThread, inputThread, offlineConsoleThread)
