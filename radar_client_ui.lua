@@ -28,6 +28,9 @@ local CFG = {
   radarCursorStep = 1,
 }
 
+-- ✅ 只连接指定 hostname 的 radar server（改成你的服务端打印出来的 hostname）
+local WANT_HOSTNAME = "radar_server_4"
+
 -------------------------
 -- rednet init (OPEN ALL MODEMS + HANDSHAKE)
 -------------------------
@@ -46,6 +49,7 @@ end
 local modems = openAllRednet()
 print("[CLIENT] Opened modems: " .. table.concat(modems, ", "))
 print("[CLIENT] myID:", os.getComputerID())
+print("[CLIENT] target hostname:", WANT_HOSTNAME)
 
 local serverId = nil
 local lastHello = 0
@@ -57,27 +61,36 @@ end
 
 hello()
 
+-- ✅ 只接受指定 hostname 的 ACK
+local function handleAck(sid, msg, proto)
+  if proto ~= "RADAR_ACK" then return false end
+  if type(msg) ~= "table" or msg.kind ~= "ack" then return false end
+
+  -- 服务端必须在 ACK 里附带 hostname
+  if msg.hostname ~= WANT_HOSTNAME then
+    -- 吃掉 ACK，避免误连其他服务器
+    return true
+  end
+
+  serverId = sid
+  print(("✅ Connected to %s (id=%s)"):format(tostring(WANT_HOSTNAME), tostring(serverId)))
+  return true
+end
+
+-- ✅ 未连接时不再广播命令，避免串台
 local function sendCmd(cmdTable)
   cmdTable.kind = "radar_cmd"
 
-  if not serverId and (os.clock() - lastHello > 1) then
-    hello()
+  if not serverId then
+    if (os.clock() - lastHello > 1) then
+      hello()
+    end
+    print("⚠ Not connected yet, waiting for:", WANT_HOSTNAME)
+    return false
   end
 
-  if serverId then
-    rednet.send(serverId, cmdTable, "RADAR_CMD")
-  else
-    rednet.broadcast(cmdTable, "RADAR_CMD")
-  end
-end
-
-local function handleAck(sid, msg, proto)
-  if proto == "RADAR_ACK" and type(msg)=="table" and msg.kind=="ack" then
-    serverId = sid
-    print("✅ Connected serverId =", serverId)
-    return true
-  end
-  return false
+  rednet.send(serverId, cmdTable, "RADAR_CMD")
+  return true
 end
 
 -------------------------
@@ -396,7 +409,8 @@ local function drawStatusOnTerm(t, hasMon)
   resetColors()
 
   print("=== AUTO CAMERA RADAR (CLIENT UI) ===")
-  print("Server:", serverId or "(broadcast)")
+  print("Target Hostname:", WANT_HOSTNAME)
+  print("Server:", serverId or "(not connected)")
   print("Monitor:", hasMon and (monitorName or "(monitor)") or "(none)")
   print("Output:", outputTarget, " | View:", viewMode, "(S)")
   print(("Radius: %d  ([ / ])"):format(tonumber(serverCFG.scanRadius) or 0))
