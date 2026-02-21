@@ -21,33 +21,27 @@ local CFG = {
   arriveDist = 3.5,
 
   -- MODE
-  isBoat = true,            -- 船模式：只用 x(turn) 和 z(throttle)，永远不动 y（按 B 切换）
+  isBoat = true,            -- ✅ 船模式：只用 x(turn) 和 z(throttle)，永远不动 y（按 B 切换）
   useCruiseAltitude = true, -- 飞艇才用；船模式会强制忽略
   cruiseY = nil,
   cruiseAboveTarget = 12.0,
   climbArriveDy = 1.5,
   descendDist = 22.0,
 
-  -- NET MODE
-  netOnline = true,         -- ONLINE=接收 SHIP_CMD；OFFLINE=手动输入坐标（仍接收 SHIP_POS）
-
   -- input tuning
-  turnGain = 1.2,
-  turnMax  = 0.7,
+  turnGain = 1.2, -- 船更稳一点（可按需调回 2.0）
+  turnMax  = 0.7, -- 船更稳一点（可按需调回 1.0）
   upGain   = 0.2,
   upMax    = 1.0,
 
   throttleFar = 1.0,
-  throttleNear = 0.12,
-  slowDist = 60.0,
+  throttleNear = 0.12, -- 船靠近更慢（可按需调回 0.20）
+  slowDist = 60.0,     -- 船减速圈更小（可按需调回 90.0）
   minThrottleDist = 3.5,
 
   spamEvery = 1.0,
 
   stopOnNewCommand = true,
-
-  -- ✅ 离线输入让出时间片（解决“输入不进去”）
-  consoleYield = 0.05,      -- 建议 0.03~0.10
 }
 
 for _,n in ipairs(peripheral.getNames()) do
@@ -98,10 +92,7 @@ print("SHIP_ID:", SHIP_ID, " NAME:", SHIP_NAME)
 print("Listening:", PROTO_CMD, PROTO_NAV, "and", PROTO_SHIP)
 print("move inputs: x=turn, y=up/down, z=throttle")
 print("MODE:", CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)")
-print("NET:", CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)")
 print("Hotkey: press B to toggle BOAT/AIRSHIP mode")
-print("Hotkey: press M to toggle OFFLINE/ONLINE (STOP+CLEAR)")
-print("OFFLINE commands: goto x y z  |  stop")
 
 local ship=nil
 local lastShipAt=0
@@ -113,19 +104,6 @@ local mode="DONE"
 
 local cmdSeq = 0
 local brakeThisTick = false
-
--- 防止按键切换把字符残留到输入里（m/b）
-local consoleJustToggled = false
-
--- STOP + CLEAR helper
-local function stopAndClear(reason)
-  target=nil
-  mode="DONE"
-  prevShip=nil
-  brakeThisTick=false
-  safeMove(0,0,0)
-  if reason then print(reason) end
-end
 
 local function onNewTarget(t)
   cmdSeq = cmdSeq + 1
@@ -164,7 +142,7 @@ local function helloThread()
   end
 end
 
--- Toggle helper
+-- ✅ Toggle helper
 local function setModeAfterToggle()
   if not target then
     mode = "DONE"
@@ -178,119 +156,19 @@ local function setModeAfterToggle()
   end
 end
 
--- ✅ 修复版：安全读一行（不会把红网事件“占着不放”）
-local function readLineSafe(prompt)
-  if prompt then write(prompt) end
-  local buf = ""
-
-  while true do
-    local ev = {os.pullEventRaw()}
-    local name = ev[1]
-
-    if name == "char" then
-      local ch = ev[2]
-      buf = buf .. ch
-      write(ch)
-
-    elseif name == "paste" then
-      local txt = ev[2] or ""
-      buf = buf .. txt
-      write(txt)
-
-    elseif name == "key" then
-      local k = ev[2]
-      if k == keys.enter then
-        print()
-        return buf
-      elseif k == keys.backspace then
-        if #buf > 0 then
-          buf = buf:sub(1, -2)
-          local x, y = term.getCursorPos()
-          if x > 1 then
-            term.setCursorPos(x - 1, y)
-            write(" ")
-            term.setCursorPos(x - 1, y)
-          end
-        end
-      end
-
-    elseif name == "rednet_message" then
-      -- ✅ 关键：把红网事件放回去，并让出时间片给 controlThread 消费
-      os.queueEvent(table.unpack(ev))
-      sleep(CFG.consoleYield)
-
-    else
-      -- 其它事件不在这里处理，直接让出 CPU
-      sleep(0)
-    end
-  end
-end
-
--- Key listener (press B/M)
+-- ✅ Key listener (press B)
 local function inputThread()
   while true do
     local ev, key = os.pullEvent("key")
     if key == keys.b then
       CFG.isBoat = not CFG.isBoat
+
+      -- brake on toggle to avoid sudden output jumps
       safeMove(0,0,0)
+
       setModeAfterToggle()
-      consoleJustToggled = true
+
       print("MODE TOGGLED -> " .. (CFG.isBoat and "BOAT (x/z only)" or "AIRSHIP (x/y/z)"))
-
-    elseif key == keys.m then
-      CFG.netOnline = not CFG.netOnline
-      stopAndClear("[NET] TOGGLED -> " .. (CFG.netOnline and "ONLINE (accept SHIP_CMD)" or "OFFLINE (manual goto)") .. " | STOPPED+CLEARED")
-      consoleJustToggled = true
-      if not CFG.netOnline then
-        print("OFFLINE commands: goto x y z  |  stop")
-      end
-    end
-  end
-end
-
--- OFFLINE console: manual goto/stop (new command overrides old)
-local function offlineConsoleThread()
-  while true do
-    if CFG.netOnline then
-      sleep(0.2)
-    else
-      -- 丢掉切换时的残留 m/b（只丢一次）
-      if consoleJustToggled then
-        consoleJustToggled = false
-        local e = {os.pullEvent()}
-        -- 如果不是输入事件，就放回去
-        if e[1] ~= "char" and e[1] ~= "key" then
-          os.queueEvent(table.unpack(e))
-        end
-      end
-
-      local line = readLineSafe("[OFFLINE] > ")
-      if line then
-        local parts = {}
-        for w in string.gmatch(tostring(line), "%S+") do
-          table.insert(parts, w)
-        end
-
-        local cmd = (parts[1] or ""):lower()
-        if cmd == "goto" then
-          local x = tonumber(parts[2])
-          local y = tonumber(parts[3])
-          local z = tonumber(parts[4])
-          if x and y and z then
-            onNewTarget({x=x, y=y, z=z, name="manual"})
-          else
-            print("Usage: goto x y z")
-          end
-
-        elseif cmd == "stop" then
-          stopAndClear("[OFFLINE] STOP")
-
-        elseif cmd == "" then
-          -- ignore
-        else
-          print("Commands: goto x y z | stop")
-        end
-      end
     end
   end
 end
@@ -299,6 +177,7 @@ local function controlThread()
   while true do
     brakeThisTick = false
 
+    -- Step 1: drain messages within tick (non-blocking)
     local t0=os.clock()
     local newestNav = nil
 
@@ -307,6 +186,7 @@ local function controlThread()
       if not sid then break end
 
       if proto==PROTO_SHIP and type(msg)=="table" and msg.kind=="ship_pos" then
+        -- IMPORTANT: only accept my ship_id
         if msg.ship_id == SHIP_ID then
           prevShip = ship
           ship = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z)}
@@ -314,20 +194,22 @@ local function controlThread()
         end
 
       elseif proto==PROTO_CMD and type(msg)=="table" and msg.kind=="ship_cmd" then
-        if CFG.netOnline then
-          if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
-            newestNav = {
-              x=tonumber(msg.target.x),
-              y=tonumber(msg.target.y),
-              z=tonumber(msg.target.z),
-              name = msg.target_name or msg.name or "target"
-            }
-          elseif msg.ship_id == SHIP_ID and msg.type == "STOP" then
-            stopAndClear("[CMD] STOP")
-          end
+        if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
+          newestNav = {
+            x=tonumber(msg.target.x),
+            y=tonumber(msg.target.y),
+            z=tonumber(msg.target.z),
+            name = msg.target_name or msg.name or "target"
+          }
+        elseif msg.ship_id == SHIP_ID and msg.type == "STOP" then
+          target=nil
+          mode="DONE"
+          safeMove(0,0,0)
+          print("[CMD] STOP")
         end
 
       elseif proto==PROTO_NAV and type(msg)=="table" and msg.kind=="nav_goto" then
+        -- legacy: broadcast nav (no ship select)
         newestNav = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z), name=msg.name}
       end
     end
@@ -358,8 +240,9 @@ local function controlThread()
           target=nil
           mode="DONE"
         else
+          -- MODE SWITCHING
           if CFG.isBoat then
-            mode = "CRUISE"
+            mode = "CRUISE" -- 船永远平面跑
           else
             if CFG.useCruiseAltitude then
               if mode=="CLIMB" and math.abs(ship.y - cruiseY) <= CFG.climbArriveDy then
@@ -372,8 +255,10 @@ local function controlThread()
             end
           end
 
+          -- Desired point
           local desired
           if CFG.isBoat then
+            -- 船：只追 x/z，y 保持当前高度（不做升降控制）
             desired = {x=target.x, y=ship.y, z=target.z}
           else
             if not CFG.useCruiseAltitude then
@@ -389,6 +274,7 @@ local function controlThread()
             end
           end
 
+          -- Heading control (based on desired x/z)
           local tx = desired.x - ship.x
           local tz = desired.z - ship.z
           local targetYaw = math.atan2(tx, tz)
@@ -407,6 +293,7 @@ local function controlThread()
           local yawErr = angleWrap(targetYaw - curYaw)
           local turn = clamp(yawErr * CFG.turnGain, -CFG.turnMax, CFG.turnMax)
 
+          -- Throttle scheduling by distance
           local t = clamp(dXZ / CFG.slowDist, 0, 1)
           local throttle = CFG.throttleNear + (CFG.throttleFar - CFG.throttleNear) * t
           if dXZ < CFG.minThrottleDist then
@@ -414,6 +301,7 @@ local function controlThread()
           end
           throttle = clamp(throttle, -1.0, 1.0)
 
+          -- Up/down axis
           local up
           if CFG.isBoat then
             up = 0
@@ -443,4 +331,5 @@ local function controlThread()
   end
 end
 
-parallel.waitForAny(controlThread, helloThread, inputThread, offlineConsoleThread)
+-- ✅ add inputThread here
+parallel.waitForAny(controlThread, helloThread, inputThread)
