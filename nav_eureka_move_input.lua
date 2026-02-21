@@ -45,6 +45,9 @@ local CFG = {
   spamEvery = 1.0,
 
   stopOnNewCommand = true,
+
+  -- ✅ 离线输入让出时间片（解决“输入不进去”）
+  consoleYield = 0.05,      -- 建议 0.03~0.10
 }
 
 for _,n in ipairs(peripheral.getNames()) do
@@ -175,15 +178,15 @@ local function setModeAfterToggle()
   end
 end
 
--- ✅ 安全读取一行：不吞 rednet_message（会把非输入事件放回队列）
+-- ✅ 修复版：安全读一行（不会把红网事件“占着不放”）
 local function readLineSafe(prompt)
   if prompt then write(prompt) end
   local buf = ""
 
   while true do
-    local ev = {os.pullEventRaw()} -- 不会被 terminate 直接打断（可选）
-
+    local ev = {os.pullEventRaw()}
     local name = ev[1]
+
     if name == "char" then
       local ch = ev[2]
       buf = buf .. ch
@@ -202,7 +205,6 @@ local function readLineSafe(prompt)
       elseif k == keys.backspace then
         if #buf > 0 then
           buf = buf:sub(1, -2)
-          -- 光标回退擦除
           local x, y = term.getCursorPos()
           if x > 1 then
             term.setCursorPos(x - 1, y)
@@ -212,9 +214,13 @@ local function readLineSafe(prompt)
         end
       end
 
-    else
-      -- ✅ 关键：把非输入事件（比如 rednet_message）放回队列，别吃掉
+    elseif name == "rednet_message" then
+      -- ✅ 关键：把红网事件放回去，并让出时间片给 controlThread 消费
       os.queueEvent(table.unpack(ev))
+      sleep(CFG.consoleYield)
+
+    else
+      -- 其它事件不在这里处理，直接让出 CPU
       sleep(0)
     end
   end
@@ -248,20 +254,13 @@ local function offlineConsoleThread()
     if CFG.netOnline then
       sleep(0.2)
     else
-      -- 吞掉刚切换带来的残留 m/b，但不吞其它事件
+      -- 丢掉切换时的残留 m/b（只丢一次）
       if consoleJustToggled then
         consoleJustToggled = false
-        while true do
-          local ev = {os.pullEvent()}
-          if ev[1] == "char" or ev[1] == "key" then
-            -- 丢弃一次输入残留即可（m/b 的 char，或者 key 释放等）
-            -- 如果你想更严格只丢 char，可改成只丢 char
-          else
-            os.queueEvent(table.unpack(ev))
-            break
-          end
-          -- 再丢一次就够了，避免无限循环
-          break
+        local e = {os.pullEvent()}
+        -- 如果不是输入事件，就放回去
+        if e[1] ~= "char" and e[1] ~= "key" then
+          os.queueEvent(table.unpack(e))
         end
       end
 
@@ -300,7 +299,6 @@ local function controlThread()
   while true do
     brakeThisTick = false
 
-    -- drain messages within tick (non-blocking)
     local t0=os.clock()
     local newestNav = nil
 
@@ -309,7 +307,6 @@ local function controlThread()
       if not sid then break end
 
       if proto==PROTO_SHIP and type(msg)=="table" and msg.kind=="ship_pos" then
-        -- IMPORTANT: only accept my ship_id (始终接收)
         if msg.ship_id == SHIP_ID then
           prevShip = ship
           ship = {x=tonumber(msg.x), y=tonumber(msg.y), z=tonumber(msg.z)}
@@ -317,7 +314,6 @@ local function controlThread()
         end
 
       elseif proto==PROTO_CMD and type(msg)=="table" and msg.kind=="ship_cmd" then
-        -- ONLINE 才接收来自客户端/服务器的指令；OFFLINE 忽略
         if CFG.netOnline then
           if msg.ship_id == SHIP_ID and msg.type == "GOTO" and type(msg.target)=="table" then
             newestNav = {
@@ -362,7 +358,6 @@ local function controlThread()
           target=nil
           mode="DONE"
         else
-          -- MODE SWITCHING
           if CFG.isBoat then
             mode = "CRUISE"
           else
@@ -377,7 +372,6 @@ local function controlThread()
             end
           end
 
-          -- Desired point
           local desired
           if CFG.isBoat then
             desired = {x=target.x, y=ship.y, z=target.z}
@@ -395,7 +389,6 @@ local function controlThread()
             end
           end
 
-          -- Heading control (based on desired x/z)
           local tx = desired.x - ship.x
           local tz = desired.z - ship.z
           local targetYaw = math.atan2(tx, tz)
@@ -414,7 +407,6 @@ local function controlThread()
           local yawErr = angleWrap(targetYaw - curYaw)
           local turn = clamp(yawErr * CFG.turnGain, -CFG.turnMax, CFG.turnMax)
 
-          -- Throttle scheduling by distance
           local t = clamp(dXZ / CFG.slowDist, 0, 1)
           local throttle = CFG.throttleNear + (CFG.throttleFar - CFG.throttleNear) * t
           if dXZ < CFG.minThrottleDist then
@@ -422,7 +414,6 @@ local function controlThread()
           end
           throttle = clamp(throttle, -1.0, 1.0)
 
-          -- Up/down axis
           local up
           if CFG.isBoat then
             up = 0
